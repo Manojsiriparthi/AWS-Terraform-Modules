@@ -1,0 +1,639 @@
+// ============================================================================
+//  TERRAFORM INFRASTRUCTURE PIPELINE  —  Declarative Pipeline
+// ============================================================================
+//
+//  PIPELINE CONCEPTS USED IN THIS FILE:
+//  ─────────────────────────────────────────────────────────────────────────
+//  pipeline {}        → The outer wrapper — every declarative pipeline needs this
+//  agent any          → Run on any available Jenkins agent (worker machine)
+//  parameters {}      → Input form shown to user before the build starts
+//  environment {}     → Variables available to ALL stages (like export in bash)
+//  stages {}          → Container that holds all your stage blocks
+//  stage('name') {}   → A named step shown in Jenkins UI as a box
+//  steps {}           → The actual commands inside a stage
+//  sh 'command'       → Run a shell command on the agent
+//  when {}            → Conditionally run a stage based on a condition
+//  input {}           → Pause pipeline and wait for a human to approve
+//  post {}            → Runs after all stages (success / failure / always)
+//  withCredentials {} → Inject secrets from Jenkins credential store
+//  withEnv {}         → Set extra env variables for a block of steps
+//  dir('path') {}     → Change directory for the steps inside
+//  echo 'text'        → Print a message to console log
+// ============================================================================
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  OUTER WRAPPER  —  Every declarative pipeline starts with  pipeline { }
+// ─────────────────────────────────────────────────────────────────────────────
+pipeline {
+
+    // ─────────────────────────────────────────────────────────────────────────
+    //  AGENT
+    //  Tells Jenkins WHERE to run this pipeline.
+    //  'any'  → use whichever agent is free
+    //  You can also say: agent { label 'linux' } to target a specific node
+    // ─────────────────────────────────────────────────────────────────────────
+    agent any
+
+    // ─────────────────────────────────────────────────────────────────────────
+    //  PARAMETERS
+    //  These create an input FORM in Jenkins UI.
+    //  The user fills this in before hitting "Build".
+    //  Access them inside the pipeline as:  params.ENVIRONMENT
+    // ─────────────────────────────────────────────────────────────────────────
+    parameters {
+
+        // choice() → dropdown menu
+        choice(
+            name        : 'ENVIRONMENT',
+            choices     : ['dev', 'test', 'prod'],
+            description : 'Which environment to deploy? dev=small, test=medium, prod=large+protected'
+        )
+
+        // choice() → second dropdown
+        choice(
+            name        : 'ACTION',
+            choices     : ['apply', 'destroy'],
+            description : 'apply = create/update infra  |  destroy = delete ALL resources'
+        )
+
+        // string() → free text input
+        string(
+            name         : 'NOTIFY_EMAIL',
+            defaultValue : '',
+            description  : '(Optional) Email address to notify when pipeline finishes'
+        )
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    //  ENVIRONMENT
+    //  Variables defined here are available in EVERY stage below.
+    //  Think of it like running 'export VAR=value' at the top of a bash script.
+    //
+    //  ${params.ENVIRONMENT}  → value the user picked (dev / test / prod)
+    //  WORKSPACE              → Jenkins built-in: path to the job's workspace folder
+    // ─────────────────────────────────────────────────────────────────────────
+    environment {
+
+        // Which folder to cd into — e.g.  environments/dev
+        ENV_DIR = "environments/${params.ENVIRONMENT}"
+
+        // Which .tfvars file to use — e.g.  dev.tfvars
+        TFVARS_FILE = "${params.ENVIRONMENT}.tfvars"
+
+        // Saved plan file name  — e.g.  tfplan-dev
+        PLAN_FILE = "tfplan-${params.ENVIRONMENT}"
+
+        // Terraform settings for CI/CD
+        // TF_IN_AUTOMATION=true  tells Terraform it is running in a pipeline
+        //   → disables interactive prompts  (no "do you want to proceed? yes/no")
+        //   → shows cleaner, less verbose output
+        TF_IN_AUTOMATION = "true"
+
+        // AWS region — all resources go here
+        AWS_DEFAULT_REGION = "us-east-1"
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    //  STAGES
+    //  A stages{} block holds all your stage() blocks.
+    //  Jenkins draws each stage as a box in the Pipeline Stage View.
+    // ─────────────────────────────────────────────────────────────────────────
+    stages {
+
+        // =====================================================================
+        // =====================================================================
+        //  STAGE 1 — CHECKOUT
+        //  Pull code directly from GitHub using url and branch defined here.
+        //  No SCM configuration needed on the Jenkins job itself.
+        //  Just change GIT_URL and GIT_BRANCH below to match your repo.
+        // =====================================================================
+        stage('Checkout') {
+            steps {
+                echo '=========================================================='
+                echo ' STAGE 1 : Checkout'
+                echo ' Pulling latest code from GitHub'
+                echo '=========================================================='
+
+                // git() step — clones the repo directly inside the pipeline
+                // url    → your GitHub repository HTTPS URL
+                // branch → which branch to pull  (main / master / dev)
+                git(
+                    url   : 'https://github.com/YOUR-USERNAME/AWS-Terraform-Modules.git',
+                    branch: 'main'
+                )
+
+                echo 'Code pulled successfully from GitHub'
+            }
+        }
+        // =====================================================================
+        //  STAGE 2 — TERRAFORM INIT
+        //
+        //  What is terraform init?
+        //    - Downloads provider plugins (aws, random, etc.)
+        //    - Configures the remote backend (S3 state file)
+        //    - Downloads any remote modules
+        //
+        //  withCredentials{} → injects secrets from Jenkins Credential store.
+        //    The secret values are MASKED in the console log (shown as ****)
+        //
+        //  dir(ENV_DIR){} → same as  cd environments/dev  in bash.
+        //    All sh commands inside run from that directory.
+        // =====================================================================
+        stage('Terraform Init') {
+            steps {
+                echo '=========================================================='
+                echo " STAGE 2 : Terraform Init  [${params.ENVIRONMENT}]"
+                echo ' Downloads providers + configures S3 remote backend'
+                echo '=========================================================='
+
+                // withCredentials pulls secrets from Jenkins → injects as env vars
+                // aws-credentials      → AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY
+                // terraform-backend-bucket → the S3 bucket name for remote state
+                withCredentials([
+                    usernamePassword(
+                        credentialsId   : 'aws-credentials',
+                        usernameVariable: 'AWS_ACCESS_KEY_ID',
+                        passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+                    ),
+                    string(
+                        credentialsId: 'terraform-backend-bucket',
+                        variable     : 'TF_STATE_BUCKET'
+                    )
+                ]) {
+                    // dir() → change directory into the environment folder
+                    dir("${ENV_DIR}") {
+                        sh '''
+                            echo "Working directory: $(pwd)"
+                            echo "Environment      : $ENVIRONMENT"
+                            echo "State bucket     : $TF_STATE_BUCKET"
+                            echo ""
+
+                            # terraform init flags:
+                            # -backend-config   → pass backend values without hardcoding them
+                            # -reconfigure      → re-initialise even if already initialised
+                            # -upgrade          → update providers to latest allowed version
+                            # -input=false      → never ask for input (CI/CD safe)
+                            terraform init \
+                                -backend-config="bucket=$TF_STATE_BUCKET" \
+                                -backend-config="key=$ENVIRONMENT/terraform.tfstate" \
+                                -backend-config="region=$AWS_DEFAULT_REGION" \
+                                -backend-config="dynamodb_table=terraform-lock-$ENVIRONMENT" \
+                                -backend-config="encrypt=true" \
+                                -reconfigure \
+                                -input=false
+                        '''
+                    }
+                }
+            }
+        }
+
+        // =====================================================================
+        //  STAGE 3 — TERRAFORM FORMAT
+        //
+        //  What is terraform fmt?
+        //    Checks that all .tf files follow the official Terraform style guide.
+        //    Consistent formatting = easier to read and review in teams.
+        //
+        //  -check      → don't modify files, just check
+        //  -diff       → show which lines would change
+        //  -recursive  → check ALL subdirectories, not just current folder
+        //
+        //  returnStatus: true → capture the exit code instead of failing the stage.
+        //    Exit 0 = all good
+        //    Exit 1 = files need formatting
+        // =====================================================================
+        stage('Terraform Format') {
+            steps {
+                echo '=========================================================='
+                echo ' STAGE 3 : Terraform Format Check'
+                echo ' Checks all .tf files follow the official style guide'
+                echo '=========================================================='
+
+                dir("${ENV_DIR}") {
+                    script {
+                        // returnStatus:true → capture exit code, don't auto-fail
+                        def fmtStatus = sh(
+                            script       : 'terraform fmt -check -diff -recursive .',
+                            returnStatus : true
+                        )
+
+                        if (fmtStatus != 0) {
+                            // Warn the developer but don't stop the pipeline
+                            // Change  echo  to  error()  to make it a hard fail
+                            echo "WARNING: Some .tf files are not formatted correctly."
+                            echo "         Fix them by running:  terraform fmt -recursive"
+                        } else {
+                            echo "All .tf files are correctly formatted."
+                        }
+                    }
+                }
+            }
+        }
+
+        // =====================================================================
+        //  STAGE 4 — TERRAFORM VALIDATE
+        //
+        //  What is terraform validate?
+        //    Checks the configuration for syntax errors and type mismatches.
+        //    Does NOT connect to AWS — runs 100% offline. Fast.
+        //    Example errors it catches:
+        //      - missing required argument
+        //      - wrong variable type (number where string expected)
+        //      - referencing a resource that doesn't exist
+        // =====================================================================
+        stage('Terraform Validate') {
+            steps {
+                echo '=========================================================='
+                echo ' STAGE 4 : Terraform Validate'
+                echo ' Checks syntax and config without connecting to AWS'
+                echo '=========================================================='
+
+                dir("${ENV_DIR}") {
+                    sh 'terraform validate'
+                }
+            }
+        }
+
+        // =====================================================================
+        //  STAGE 5 — TERRAFORM PLAN
+        //
+        //  What is terraform plan?
+        //    Connects to AWS + reads the current state file.
+        //    Computes the DIFF between what exists and what the code says.
+        //    Shows every resource that will be:
+        //      +  created
+        //      ~  updated in-place
+        //      -  destroyed
+        //      -/+ replaced (destroyed then recreated — DESTRUCTIVE)
+        //
+        //  -out=PLAN_FILE  → save the plan to a binary file.
+        //    IMPORTANT: Using a saved plan means:
+        //      - Stage 8 (apply) executes EXACTLY what was reviewed here.
+        //      - No surprise changes between plan and apply.
+        //      - This is the correct CI/CD pattern.
+        //
+        //  -destroy  → generate a plan to DESTROY all resources (used when action=destroy)
+        //
+        //  TF_VAR_db_password  → the DB password is injected as an env var
+        //    Terraform automatically picks up TF_VAR_* environment variables.
+        //    The password never appears in the Jenkinsfile or tfvars.
+        // =====================================================================
+        stage('Terraform Plan') {
+            steps {
+                echo '=========================================================='
+                echo " STAGE 5 : Terraform Plan  [${params.ENVIRONMENT}] [${params.ACTION}]"
+                echo ' Computes what changes Terraform will make — no changes yet'
+                echo '=========================================================='
+
+                withCredentials([
+                    usernamePassword(
+                        credentialsId   : 'aws-credentials',
+                        usernameVariable: 'AWS_ACCESS_KEY_ID',
+                        passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+                    ),
+                    string(
+                        credentialsId: "terraform-db-password-${params.ENVIRONMENT}",
+                        variable     : 'TF_VAR_db_password'
+                    )
+                ]) {
+                    dir("${ENV_DIR}") {
+                        script {
+                            // Build the plan command based on the chosen ACTION
+                            if (params.ACTION == 'destroy') {
+                                // -destroy flag tells plan to compute a destroy plan
+                                sh """
+                                    terraform plan \\
+                                        -destroy \\
+                                        -var-file="${TFVARS_FILE}" \\
+                                        -out="${PLAN_FILE}" \\
+                                        -input=false
+                                """
+                            } else {
+                                // Normal apply plan
+                                sh """
+                                    terraform plan \\
+                                        -var-file="${TFVARS_FILE}" \\
+                                        -out="${PLAN_FILE}" \\
+                                        -input=false
+                                """
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // =====================================================================
+        //  STAGE 6 — SHOW PLAN  (human-readable diff)
+        //
+        //  What is terraform show?
+        //    Converts the binary plan file back to human-readable text.
+        //    Without -out/show, you only see a summary.
+        //    With show, you see EVERY attribute of EVERY resource change.
+        //
+        //  Why a separate stage?
+        //    Keep plan creation (Stage 5) separate from reviewing (Stage 6).
+        //    Students can clearly see: first we GENERATE the plan, then we READ it.
+        // =====================================================================
+        stage('Show Plan') {
+            steps {
+                echo '=========================================================='
+                echo ' STAGE 6 : Show Plan  (full human-readable diff)'
+                echo ' Review EVERY change before it is applied'
+                echo '=========================================================='
+
+                dir("${ENV_DIR}") {
+                    sh """
+                        echo ""
+                        echo "  + green  = resource will be CREATED"
+                        echo "  ~ yellow = resource will be UPDATED"
+                        echo "  - red    = resource will be DESTROYED"
+                        echo " -/+ red   = resource will be REPLACED (destroy + create)"
+                        echo ""
+                        echo "----------------------------------------------------------"
+
+                        # -no-color → plain text output (easier to read in Jenkins logs)
+                        terraform show -no-color "${PLAN_FILE}"
+
+                        echo "----------------------------------------------------------"
+                    """
+                }
+            }
+        }
+
+        // =====================================================================
+        //  STAGE 7 — PROD MANUAL APPROVAL
+        //
+        //  when { } → this stage ONLY runs when the condition is true.
+        //    Here: only when ENVIRONMENT is 'prod'
+        //    For dev and test this entire stage is SKIPPED automatically.
+        //
+        //  input { } → pauses the pipeline and shows a form in Jenkins UI.
+        //    A person must click Approve or Abort within the timeout.
+        //    If no one responds in 30 minutes → pipeline aborts automatically.
+        //
+        //  Why manual approval for prod only?
+        //    dev/test → fast iteration, mistakes are cheap, easy to fix
+        //    prod     → real users, real data, mistakes are expensive
+        //               a human MUST review the plan before any change
+        // =====================================================================
+        stage('Prod Manual Approval') {
+
+            // when{} block → only run this stage if condition is true
+            when {
+                // expression{} → evaluate a Groovy expression
+                // params.ENVIRONMENT == 'prod' is true only for production
+                expression { params.ENVIRONMENT == 'prod' }
+            }
+
+            steps {
+                echo '=========================================================='
+                echo ' STAGE 7 : Manual Approval  [PROD ONLY]'
+                echo ' Pipeline is PAUSED — a human must approve before continuing'
+                echo '=========================================================='
+
+                echo "ACTION requested : ${params.ACTION.toUpperCase()}"
+                echo "Review the plan output in Stage 6 carefully."
+                echo "Any  -/+  lines mean a resource will be REPLACED (downtime risk)."
+                echo ""
+
+                // timeout{} → if no one approves within 30 minutes, abort the pipeline
+                timeout(time: 30, unit: 'MINUTES') {
+
+                    // input{} → shows a form in Jenkins UI and waits for a click
+                    input(
+                        message : "PROD ${params.ACTION.toUpperCase()} — approve or abort?",
+                        ok      : 'Approve and Continue',
+                        // submitterParameter → captures the username of who approved
+                        submitterParameter: 'APPROVED_BY'
+                    )
+                }
+
+                // This line only runs if Approve was clicked (Abort throws an exception)
+                echo "Approved! Pipeline will now execute: ${params.ACTION}"
+            }
+        }
+
+        // =====================================================================
+        //  STAGE 8 — APPLY or DESTROY
+        //
+        //  This stage executes the SAVED plan from Stage 5.
+        //  Using a saved plan file guarantees:
+        //    - Exactly the change you reviewed is what runs
+        //    - No new resources sneak in between plan and apply
+        //    - Safe for CI/CD
+        //
+        //  terraform apply PLAN_FILE  → apply a saved plan (no extra flags needed)
+        //  -auto-approve              → don't ask "do you want to proceed?"
+        //                               safe here because we have the saved plan
+        //                               and prod was gated by manual approval above
+        //
+        //  when { } → APPLY stage only runs for action=apply
+        //  The DESTROY stage below runs for action=destroy
+        // =====================================================================
+        stage('Terraform Apply') {
+
+            // Only run this stage when user chose ACTION = apply
+            when {
+                expression { params.ACTION == 'apply' }
+            }
+
+            steps {
+                echo '=========================================================='
+                echo " STAGE 8 : Terraform Apply  [${params.ENVIRONMENT}]"
+                echo ' Creating / updating infrastructure using the saved plan'
+                echo '=========================================================='
+
+                withCredentials([
+                    usernamePassword(
+                        credentialsId   : 'aws-credentials',
+                        usernameVariable: 'AWS_ACCESS_KEY_ID',
+                        passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+                    ),
+                    string(
+                        credentialsId: "terraform-db-password-${params.ENVIRONMENT}",
+                        variable     : 'TF_VAR_db_password'
+                    )
+                ]) {
+                    dir("${ENV_DIR}") {
+                        sh """
+                            # Apply the saved plan file
+                            # -auto-approve is safe — the plan was already reviewed
+                            # and prod was approved by a human in Stage 7
+                            terraform apply -auto-approve "${PLAN_FILE}"
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Terraform Destroy') {
+
+            // Only run this stage when user chose ACTION = destroy
+            when {
+                expression { params.ACTION == 'destroy' }
+            }
+
+            steps {
+                echo '=========================================================='
+                echo " STAGE 8 : Terraform Destroy  [${params.ENVIRONMENT}]"
+                echo ' DELETING all infrastructure using the saved destroy plan'
+                echo '=========================================================='
+
+                withCredentials([
+                    usernamePassword(
+                        credentialsId   : 'aws-credentials',
+                        usernameVariable: 'AWS_ACCESS_KEY_ID',
+                        passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+                    ),
+                    string(
+                        credentialsId: "terraform-db-password-${params.ENVIRONMENT}",
+                        variable     : 'TF_VAR_db_password'
+                    )
+                ]) {
+                    dir("${ENV_DIR}") {
+                        sh """
+                            # The PLAN_FILE was created with -destroy flag in Stage 5
+                            # Applying it executes the destroy plan
+                            terraform apply -auto-approve "${PLAN_FILE}"
+                        """
+                    }
+                }
+            }
+        }
+
+        // =====================================================================
+        //  STAGE 9 — TERRAFORM OUTPUT
+        //
+        //  What is terraform output?
+        //    Prints all the values defined in outputs.tf after apply.
+        //    e.g. EC2 IP address, EKS endpoint, RDS endpoint, S3 bucket name
+        //    Useful so you know WHERE things are without going to AWS Console.
+        //
+        //  when {} → only run this after APPLY (no output after destroy)
+        // =====================================================================
+        stage('Terraform Output') {
+
+            when {
+                expression { params.ACTION == 'apply' }
+            }
+
+            steps {
+                echo '=========================================================='
+                echo ' STAGE 9 : Terraform Output'
+                echo ' Prints all deployed resource details (IPs, endpoints etc.)'
+                echo '=========================================================='
+
+                withCredentials([
+                    usernamePassword(
+                        credentialsId   : 'aws-credentials',
+                        usernameVariable: 'AWS_ACCESS_KEY_ID',
+                        passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+                    )
+                ]) {
+                    dir("${ENV_DIR}") {
+                        sh '''
+                            echo ""
+                            echo "Deployed Resources:"
+                            echo "----------------------------------------------------------"
+                            terraform output
+                            echo "----------------------------------------------------------"
+                        '''
+                    }
+                }
+            }
+        }
+
+    } // end stages
+
+
+    // ─────────────────────────────────────────────────────────────────────────
+    //  POST
+    //  Runs AFTER all stages complete — regardless of pass or fail.
+    //
+    //  always {}  → runs no matter what (cleanup, notifications)
+    //  success {} → runs only when ALL stages passed
+    //  failure {} → runs only when any stage failed
+    //  aborted {} → runs when pipeline was manually stopped
+    // ─────────────────────────────────────────────────────────────────────────
+    post {
+
+        // always{} → cleanup runs whether the pipeline succeeded or failed
+        always {
+            echo '=========================================================='
+            echo ' POST : Cleanup'
+            echo '=========================================================='
+
+            // Delete the binary plan file from the workspace
+            // The plan file contains infrastructure config — remove it for security
+            sh """
+                rm -f ${ENV_DIR}/${PLAN_FILE}
+                echo "Plan file cleaned up: ${ENV_DIR}/${PLAN_FILE}"
+            """
+
+            // Print the final build result in a clear box
+            echo """
++----------------------------------------------------------+
+|  PIPELINE RESULT : ${currentBuild.currentResult.padRight(38)}|
+|  Environment     : ${params.ENVIRONMENT.padRight(38)}|
+|  Action          : ${params.ACTION.padRight(38)}|
+|  Build Number    : #${env.BUILD_NUMBER.padRight(37)}|
+|  Duration        : ${currentBuild.durationString.padRight(38)}|
++----------------------------------------------------------+
+"""
+        }
+
+        success {
+            echo "SUCCESS : Terraform ${params.ACTION} completed for ${params.ENVIRONMENT}"
+
+            // Send email notification if address was provided
+            script {
+                if (params.NOTIFY_EMAIL?.trim()) {
+                    mail(
+                        to      : params.NOTIFY_EMAIL,
+                        subject : "[Jenkins SUCCESS] Terraform ${params.ACTION} - ${params.ENVIRONMENT.toUpperCase()}",
+                        body    : """
+Terraform pipeline completed successfully.
+
+Environment : ${params.ENVIRONMENT}
+Action      : ${params.ACTION}
+Build       : #${env.BUILD_NUMBER}
+Duration    : ${currentBuild.durationString}
+
+Console log : ${env.BUILD_URL}console
+"""
+                    )
+                }
+            }
+        }
+
+        failure {
+            echo "FAILED : Terraform ${params.ACTION} failed for ${params.ENVIRONMENT}"
+            echo "Check console output for the error details."
+
+            script {
+                if (params.NOTIFY_EMAIL?.trim()) {
+                    mail(
+                        to      : params.NOTIFY_EMAIL,
+                        subject : "[Jenkins FAILED] Terraform ${params.ACTION} - ${params.ENVIRONMENT.toUpperCase()}",
+                        body    : """
+Terraform pipeline FAILED.
+
+Environment : ${params.ENVIRONMENT}
+Action      : ${params.ACTION}
+Build       : #${env.BUILD_NUMBER}
+
+Console log : ${env.BUILD_URL}console
+"""
+                    )
+                }
+            }
+        }
+
+        aborted {
+            echo "ABORTED : Pipeline was stopped manually or timed out waiting for approval."
+        }
+
+    } // end post
+
+} // end pipeline
